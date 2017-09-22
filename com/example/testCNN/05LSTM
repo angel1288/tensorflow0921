@@ -1,0 +1,321 @@
+# coding=utf-8
+import numpy as np
+import tensorflow as tf
+from tensorflow.examples.tutorials.rnn.ptb import reader
+import time
+
+# """
+# 在构建模型和训练之前，我们首先需要设置一些参数。
+# tf中可以使用tf.flags来进行全局的参数设置
+# """
+# # flags是一个文件：flags.py，用于处理命令行参数的解析工作
+# flags = tf.flags
+# logging = tf.logging
+#
+# # 调用flags内部的DEFINE_string函数来制定解析规则
+# # 定义变量model的值为small, 后面的是注释;若model的值为small，则会调用SmallConfig
+# flags.DEFINE_string("model", "small",
+# 										"A type of model. Possible options are: small, medium, large.")
+# # 定义下载好的数据的存放位置
+# flags.DEFINE_string("data_path",
+# 										'E:/ImageRecognition/TensorflowExample/com/example/testCNN/simple-examples/data',
+# 										"data_path")
+# # 是否使用 float16格式？
+# flags.DEFINE_bool("use_fp16", False,
+# 									"Train using 16-bit floats instead of 32bit floats")
+#
+# # 可以使用FLAGS.model来调用变量model的值；FLAGS是一个对象，保存了解析后的命令行参数
+# FLAGS = flags.FLAGS
+#
+#
+# def data_type():
+# 	return tf.float16 if FLAGS.use_fp16 else tf.float32
+
+
+# ###########定义语言模型处理输入数据的类class：PTBInput############
+# 初始化方法：读取参数config中的batch_size、num_steps到本地变量
+# num_steps：LSTM的展开步数；epoch_size：每个epoch内需要多少轮的训练的迭代
+# reader.ptb_producer：获取特征数据input_data，以及label数据targets
+class PTBInput(object):
+	def __init__(self, config, data, name=None):
+		self.batch_size = batch_size = config.batch_size  # 每批数据的规模
+		self.num_steps = num_steps = config.num_steps  # 单个数据中，序列的长度
+		self.epoch_size = ((len(data) // batch_size) - 1) // num_steps
+		self.input_data, self.targets = reader.ptb_producer(data, batch_size, num_steps, name=name)
+
+
+# ###########定义语言模型的类class：PTBModel############
+class PTBModel(object):
+	def __init__(self, is_training, config, input_):
+		self._input = input_
+
+		batch_size = input_.batch_size
+		num_steps = input_.num_steps
+		size = config.hidden_size  # 隐藏层中单元数目,LSTM的节点数
+		vocab_size = config.vocab_size  # 词汇表的大小
+
+		def lstm_cell():
+			# BasicLSTMCell 是最简单的LSTMCell；输入和输出的states为c(cell状态)和h（输出）的二元组
+			# 输入、输出、cell的维度相同：batch_size * size
+			return tf.contrib.rnn.BasicLSTMCell(size, forget_bias=0.0, state_is_tuple=True)
+
+		attn_cell = lstm_cell
+
+		# 若在训练状态且Dropout的keep_prob小于1，则在lstm_cell之后接一个Dropout层
+		if is_training and config.keep_prob < 1:
+			def attn_cell():
+				# 在Cell外部包裹上dropout，使其具有dropout功能
+				return tf.contrib.rnn.DropoutWrapper(lstm_cell(), output_keep_prob=config.keep_prob)
+
+		# tf.contrib.rnn.MultiRNNCell：RNN堆叠函数，堆叠多层网络
+		cell = tf.contrib.rnn.MultiRNNCell(
+			[attn_cell() for _ in range(config.num_layers)],
+			state_is_tuple=True)
+		# 设置LSTM单元的初始状态为0，c和h全初始化为0， shape为：batch_size * size
+		self._initial_state = cell.zero_state(batch_size, tf.float32)
+
+		# 创建网络的词嵌入embedding部分，即：为将one-hot的编码格式的单词转化为向量表达模式
+		with tf.device("/cpu:0"):
+			# 初始化embedding矩阵，行数为词汇表数，列数为hidden_size
+			# 通过所给的名字创建或是返回一个变量
+			embedding = tf.get_variable("embedding", [vocab_size, size], dtype=tf.float32)
+			# 查找单词对应的向量表达获得inputs
+			inputs = tf.nn.embedding_lookup(embedding, input_.input_data)
+		# 添加一层dropout
+		if is_training and config.keep_prob < 1:
+			inputs = tf.nn.dropout(inputs, config.keep_prob)
+
+		# ############定义输出#############
+		outputs = []
+		state = self._initial_state
+		#  通过 tf.get_variable()为变量名指定命名空间
+		with tf.variable_scope("RNN"):
+			# 为控制循环步数，会限制梯度在反向传播时可以展开的步数为固定值num_steps
+			for time_step in range(num_steps):
+				if time_step > 0:
+					# 从循环第二次开始使用下面设置复用变量
+					tf.get_variable_scope().reuse_variables()
+					# inputs有3个维度：batch中第几个样本，样本中第几个单词，单词向量表达的维度
+					# inputs[:, time_step, :]：所有样本的第time_step个单词
+					(cell_output, state) = cell(inputs[:, time_step, :], state)
+					outputs.append(cell_output)
+		output = tf.reshape(tf.concat(outputs, 1), [-1, size])
+		# 定义softmax层
+		softmax_w = tf.get_variable("softmax_w", [size, vocab_size], dtype=tf.float32)
+		softmax_b = tf.get_variable("softmax_b", [vocab_size], dtype=tf.float32)
+		logits = tf.matmul(output, softmax_w) + softmax_b
+		# 计算并输出logits和targets的偏差：-1/N * (1~N之和)ln(p_target_i)
+		loss = tf.contrib.legacy_seq2seq.sequence_loss_by_example(
+			[logits],
+			[tf.reshape(input_.targets, [-1])],
+			[tf.ones([batch_size * num_steps], dtype=tf.float32)])
+		# 汇总batch的误差，并平均到每个样本的误差cost
+		self._cost = cost = tf.reduce_sum(loss) / batch_size
+		# 保留最终状态
+		self._final_state = state
+		# 若不是训练状态，则直接返回
+		if not is_training:
+			return
+		# 定义学习速率的变量
+		self._lr = tf.Variable(0.0, trainable=False)
+		# 计算tvars的梯度，并用tf.clip_by_global_norm设置梯度的最大范数max_grad_norm
+		tvars = tf.trainable_variables()  # 返回需要训练的变量列表
+		# 通过权重梯度的总和的比率来截取多个张量的值
+		grads, _ = tf.clip_by_global_norm(tf.gradients(config, tvars), config.max_grad_norm)
+		optimizer = tf.train.GradientDescentOptimizer(self._lr)
+		self._train_op = optimizer.apply_gradients(zip(grads, tvars),
+																							 global_step=tf.contrib.framewok.get_or_create_global_step())
+
+		# 设置一个占位符控制学习速率
+		self._new_lr = tf.placeholder(tf.float32, shape=[], name="new_lerning_rate")
+		# 将新的学习速率赋值给当前学习速率
+		self._lr_update = tf.assign(self._lr, self._new_lr)
+
+	# 定义外部控制模型的学习速率
+	def assign_lr(self, session, lr_value):
+		session.run(self._lr_update, feed_dict={self._new_lr: lr_value})
+
+	# 定义class的一些property，方便外部访问
+	# python加@property装饰器可将返回变量设为只读，防止修改变量引发的问题
+	@property
+	def input(self):
+		return self._input
+
+	@property
+	def initial_state(self):
+		return self._initial_state
+
+	@property
+	def cost(self):
+		return self._cost
+
+	@property
+	def final_state(self):
+		return self._final_state
+
+	@property
+	def lr(self):
+		return self._lr
+
+	@property
+	def train_op(self):
+		return self._train_op
+
+
+"""
+##############几种不同大小的模型参数###################
+init_scale：网络中权重值的初识scale
+learning_rate：学习速率的初始值
+max_grad_norm：梯度的最大范数
+num_layers：LSTM可以堆叠的层数
+num_steps：LSTM梯度反向传播的展开步数
+hiddem_size：LSTM内的隐含节点数
+max_max_epoch：总共可以训练的epoch数
+keep_prob：dropout层的保留节点的比例
+lr_decay：学习速率的衰减速度
+batch_size：每个batch中的样本数量
+"""
+
+
+class SmallConfig(object):
+	init_scale = 0.1  # 相关参数的初始值为随机均匀分布，范围是[-init_scale,+init_scale]
+	learning_rate = 1.0  # 学习速率,在文本循环次数超过max_epoch以后会逐渐降低
+	max_grad_norm = 5  # 用于控制梯度膨胀，如果梯度向量的L2模超过max_grad_norm，则等比例缩小
+	num_layers = 2  # lstm层数
+	num_steps = 20  # 单个数据中，序列的长度。
+	hidden_size = 200  # 隐藏层中单元数目
+	max_epoch = 4  # epoch<max_epoch时，lr_decay值=1,epoch>max_epoch时,lr_decay逐渐减小
+	max_max_epoch = 13  # 指的是整个文本循环次数。
+	keep_prob = 1.0  # 用于dropout.每批数据输入时神经网络中的每个单元会以1-keep_prob的概率不工作，可以防止过拟合
+	lr_decay = 0.5  # 学习速率衰减
+	batch_size = 20  # 每批数据的规模，每批有20个。
+	vocab_size = 10000  # 词典规模，总共10K个词
+
+
+class MediumConfig(object):
+	init_scale = 0.05  # 相关参数的初始值为随机均匀分布，范围是[-init_scale,+init_scale]
+	learning_rate = 1.0  # 学习速率,在文本循环次数超过max_epoch以后会逐渐降低
+	max_grad_norm = 5  # 用于控制梯度膨胀，如果梯度向量的L2模超过max_grad_norm，则等比例缩小
+	num_layers = 2  # lstm层数
+	num_steps = 35  # 单个数据中，序列的长度。
+	hidden_size = 650  # 隐藏层中单元数目
+	max_epoch = 6  # epoch<max_epoch时，lr_decay值=1,epoch>max_epoch时,lr_decay逐渐减小
+	max_max_epoch = 39  # 指的是整个文本循环次数。
+	keep_prob = 0.5  # 用于dropout.每批数据输入时神经网络中的每个单元会以1-keep_prob的概率不工作，可以防止过拟合
+	lr_decay = 0.8  # 学习速率衰减
+	batch_size = 20  # 每批数据的规模，每批有20个。
+	vocab_size = 10000  # 词典规模，总共10K个词
+
+
+class LargeConfig(object):
+	init_scale = 0.04
+	learning_rate = 1.0
+	max_grad_norm = 10
+	num_layers = 2
+	num_steps = 35
+	hidden_size = 1500
+	max_epoch = 14
+	max_max_epoch = 55
+	keep_prob = 0.35
+	lr_decay = 1 / 1.15
+	batch_size = 20
+	vocab_size = 10000
+
+
+class TestConfig(object):
+	init_scale = 0.1
+	learning_rate = 1.0
+	max_grad_norm = 1
+	num_layers = 1
+	num_steps = 2
+	hidden_size = 2
+	max_epoch = 1
+	max_max_epoch = 1
+	keep_prob = 1.0
+	lr_decay = 0.5
+	batch_size = 20
+	vocab_size = 10000
+
+
+# 定义训练一个epoch数据的函数run_epoch
+def run_epoch(session, model, eval_op=None, verbose=False):
+	start_time = time.time()
+	costs = 0.0  # 初始化损失
+	iters = 0  # 迭代数
+	state = session.run(model.initial_state)  # 初始化状态并获得初始状态
+
+	fetches = [model.cost, model.final_state, eval_op]  # 要获取的值
+
+	if eval_op is not None:
+		fetches["eval_op"] = eval_op
+
+	for step in range(model.input.epoch_size):
+		feed_dict = {}
+		for i, (c, h) in enumerate(model.initial_state):
+			feed_dict[c] = state[i].c
+			feed_dict[h] = state[i].h
+
+		vals = session.run(fetches, feed_dict)  # 运行session,获得cost和state
+		cost = vals["cost"]
+		state = vals["final_state"]
+
+		costs += cost  # 将 cost 累积
+		iters += model.input.num_steps
+
+		if verbose and step % (model.input.epoch_size // 10) == 10:  # 也就是每个epoch要输出10个perplexity值
+			print("%.3f perplexity: %.3f speed: %.0f wps" %
+						(step * 1.0 / model.input.epoch_size, np.exp(costs / iters),
+						 iters * model.input.batch_size / (time.time() - start_time)))
+
+	return np.exp(costs / iters)
+
+
+# 读取解压后的数据
+raw_data = reader.ptb_raw_data('E:/master/TensorflowExample0915/com/example/testCNN/simple-examples/data')
+train_data, valid_data, test_data, _ = raw_data
+
+config = SmallConfig()
+eval_config = SmallConfig()
+eval_config.batch_size = 1
+eval_config.num_steps = 1
+
+with tf.Graph().as_default():
+	initializer = tf.random_uniform_initializer(-config.init_scale,
+																							config.init_scale)
+	with tf.name_scope("Train"):
+		train_input = PTBInput(config=config, data=train_data, name="TrainInput")
+		with tf.variable_scope("Model", reuse=None, initializer=initializer):
+			m = PTBModel(is_training=True, config=config, input_=train_input)
+			# tf.scalar_summary("Training Loss", m.cost)
+			# tf.scalar_summary("Learning Rate", m.lr)
+
+with tf.name_scope("Valid"):
+	valid_input = PTBInput(config=config, data=valid_data, name="ValidInput")
+	with tf.variable_scope("Model", reuse=True, initializer=initializer):
+		mvalid = PTBModel(is_training=False, config=config, input_=valid_input)
+	# tf.scalar_summary("Validation Loss", mvalid.cost)
+
+with tf.name_scope("Test"):
+	test_input = PTBInput(config=eval_config, data=test_data, name="TestInput")
+	with tf.variable_scope("Model", reuse=True, initializer=initializer):
+		mtest = PTBModel(is_training=False, config=eval_config,
+										 input_=test_input)
+
+sv = tf.train.Supervisor()
+with sv.managed_session() as session:
+	for i in range(config.max_max_epoch):
+		lr_decay = config.lr_decay ** max(i + 1 - config.max_epoch, 0.0)
+		m.assign_lr(session, config.learning_rate * lr_decay)
+
+		print("Epoch: %d Learning rate: %.3f" % (i + 1, session.run(m.lr)))
+		train_perplexity = run_epoch(session, m, eval_op=m.train_op,
+																 verbose=True)
+		print("Epoch: %d Train Perplexity: %.3f" % (i + 1, train_perplexity))
+		valid_perplexity = run_epoch(session, mvalid)
+		print("Epoch: %d Valid Perplexity: %.3f" % (i + 1, valid_perplexity))
+
+	test_perplexity = run_epoch(session, mtest)
+	print("Test Perplexity: %.3f" % test_perplexity)
+
+ # if __name__ == "__main__":
+ # tf.app.run()
